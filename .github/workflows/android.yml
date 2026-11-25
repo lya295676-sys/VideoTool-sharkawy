@@ -8,6 +8,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install app icon
+        run: |
+          mkdir -p app/src/main/res/mipmap-xxxhdpi
+          cp ic_launcher.png app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
