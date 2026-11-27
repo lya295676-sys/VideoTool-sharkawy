@@ -1730,15 +1730,18 @@ class MainActivity : Activity() {
         }.start()
     }
     private fun ensureFrames(uri: Uri, durMs: Long) {
+        if (exporting) return
         if (framesCache.containsKey(uri) || !framesLoading.add(uri)) return
         try {
             framesPool.execute {
                 val list = ArrayList<Bitmap>()
                 val r = MediaMetadataRetriever()
                 try {
+                    if (exporting) throw IllegalStateException("export")
                     r.setDataSource(this@MainActivity, uri)
                     val n = (durMs / 6000L).toInt().coerceIn(5, 24)
                     for (k in 0 until n) {
+                        if (exporting) break
                         var tUs = durMs * 1000L * k / n
                         val maxUs = max(0L, durMs - 1L) * 1000L
                         if (tUs > maxUs) tUs = maxUs
@@ -2302,6 +2305,8 @@ class MainActivity : Activity() {
     }
     // ---------- التصدير ----------
     private var exportPoll: Runnable? = null
+    @Volatile
+    private var exporting = false
     private val probeCache = ConcurrentHashMap<Uri, Probe>()
     /** بيقرا من الملف: معدل الفريمات + هل فيه مسار صوت (بيتخزّن عشان مايتكررش) */
     private fun probeSrc(u: Uri): Probe {
@@ -2488,10 +2493,9 @@ class MainActivity : Activity() {
     }
     private fun runExport(q: Quality) {
         if (clips.isEmpty()) return
-        player?.pause()
-        // مهم للسرعة: نفضّي المعاينة عشان ExoPlayer يسيب الـ decoders الهاردوير للتصدير
-        // (لو فاضلين محجوزين، التصدير بيقع على decoder سوفتوير بطيء)
-        releasePreviewForExport()
+        // مهم للسرعة: نقفل مشغّل المعاينة بالكامل (والمفكّكات اللي ماسكها) قبل ما التصدير يبدأ،
+        // وإلا التصدير بيقع على مفكّك سوفتوير بطيء في نص الطريق
+        releasePlayerForExport()
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
@@ -2507,6 +2511,11 @@ class MainActivity : Activity() {
         val layout = if (fillMode) Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP else Presentation.LAYOUT_SCALE_TO_FIT
         val ar = ow.toFloat() / oh.toFloat()
         val out = File(cacheDir, "export_" + System.currentTimeMillis() + ".mp4")
+        val rep = StringBuilder()
+        rep.append("جهاز: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL)
+            .append("  Android ").append(Build.VERSION.SDK_INT).append('\n')
+        rep.append("ترميز: ").append(if (useHevc) "HEVC" else "H.264").append("  ")
+            .append(ow).append('x').append(oh).append("  ").append(vBps / 1000).append("kbps\n")
         val items = ArrayList<EditedMediaItem>()
         for (i in clips.indices) {
             val c = clips[i]
@@ -2531,7 +2540,13 @@ class MainActivity : Activity() {
             val clock = TrClock()
             val vfx = ArrayList<Effect>()
             // تسجيلات 60fps: نقلل لـ 30 (نفس الجودة تقريبًا في شرح الشاشة وحجم أقل بكتير)
-            if (probeSrc(c.uri).fps > 40) vfx.add(FrameDropEffect.createDefaultFrameDropEffect(30f))
+            val pr = probeSrc(c.uri)
+            rep.append('#').append(i + 1).append(' ').append(c.dw).append('x').append(c.dh)
+                .append(" @").append(pr.fps).append("fps ").append(fmtTime(c.lenMs))
+            if (c.denoise) rep.append(" DN")
+            if (c.transitionId >= 0) rep.append(" TR")
+            rep.append('\n')
+            if (pr.fps > 32) vfx.add(FrameDropEffect.createDefaultFrameDropEffect(30f))
             vfx.add(Presentation.createForWidthAndHeight(ow, oh, layout))
             if (inId >= 0) vfx.add(TrMatrixFx(inId, false, lenUs, inUs, ar, clock))
             if (outId >= 0) vfx.add(TrMatrixFx(outId, true, lenUs, outUs, ar, clock))
@@ -2580,7 +2595,7 @@ class MainActivity : Activity() {
             val appCtx = applicationContext
             handler.postDelayed({ ExportService.stop(appCtx) }, 1500)
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            if (!isDestroyed) syncPlayer()   // نرجّع المعاينة بعد ما التصدير يخلص/يتلغي
+            restorePlayerAfterExport()   // نرجّع المعاينة بعد ما التصدير يخلص/يتلغي
         }
         val encFactory = DefaultEncoderFactory.Builder(this)
             .setRequestedVideoEncoderSettings(
@@ -2629,6 +2644,7 @@ class MainActivity : Activity() {
             .setTitle("جاري التصدير…")
             .setView(box)
             .setCancelable(false)
+            .setNeutralButton("نسخ تقرير", null)
             .setNegativeButton("إلغاء") { _, _ ->
                 val tr = activeTransformer
                 activeTransformer = null
@@ -2642,12 +2658,16 @@ class MainActivity : Activity() {
             .create()
         dlg = d
         d.show()
+        d.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("export", rep.toString()))
+            toast("تم نسخ التقرير")
+        }
         ExportService.start(applicationContext)
         t.start(composition, out.absolutePath)
         var lastP = -1
-        var smpTs = startTs
-        var smpPct = 0
-        var curSpeed = 0.0
+        var lastLog = -1
+        var lastThermal = 0L
         val poll = object : Runnable {
             override fun run() {
                 val tr = activeTransformer ?: return
@@ -2658,20 +2678,20 @@ class MainActivity : Activity() {
                         lastP = holder.progress
                         ExportService.progress(applicationContext, holder.progress)
                     }
-                    val nowTs = System.currentTimeMillis()
-                    if (nowTs - smpTs >= 3000L) {
-                        val dPct = holder.progress - smpPct
-                        val dSec = (nowTs - smpTs) / 1000.0
-                        if (dPct > 0) {
-                            val sp = totalMs() / 1000.0 * dPct / 100.0 / dSec   // سرعة آخر ~3 ثواني (بالنسبة لمدة الفيديو)
-                            curSpeed = if (curSpeed <= 0.0) sp else curSpeed * 0.5 + sp * 0.5
-                        }
-                        smpTs = nowTs
-                        smpPct = holder.progress
-                        if (curSpeed > 0.0) {
-                            val leftSec = (totalMs() / 1000.0 * (100 - holder.progress) / 100.0 / curSpeed).toLong()
-                            speedTv.text = "السرعة: " + String.format(Locale.US, "%.1f", curSpeed) + "x  •  باقي ≈ " + fmtTime(leftSec * 1000L)
-                        }
+                    if (holder.progress / 5 != lastLog) {
+                        lastLog = holder.progress / 5
+                        val el = (System.currentTimeMillis() - startTs) / 1000
+                        rep.append(holder.progress).append("% @").append(el).append("s  thermal=")
+                            .append(thermalStatus()).append('\n')
+                    }
+                }
+                val nowTs = System.currentTimeMillis()
+                if (nowTs - lastThermal > 2000L) {
+                    lastThermal = nowTs
+                    speedTv.text = if (thermalStatus() >= 2) {
+                        "الموبايل سخن – التصدير بيبطّأ لحماية الجهاز. سيبه يبرد وهيكمّل لوحده."
+                    } else {
+                        "ابقى سايب التطبيق مفتوح لحد ما يخلص"
                     }
                 }
                 handler.postDelayed(this, 400)
@@ -2680,14 +2700,32 @@ class MainActivity : Activity() {
         exportPoll = poll
         handler.post(poll)
     }
-    /** بيقفل المعاينة ويحرر الـ decoders قبل التصدير (بيتعاد تحميلها بعد التصدير في stopPoll) */
-    private fun releasePreviewForExport() {
-        val p = player ?: return
+    /** بيقفل مشغّل المعاينة بالكامل ويحرر الـ decoders والـ AudioTrack قبل التصدير */
+    private fun releasePlayerForExport() {
+        exporting = true
+        previewStopAt = 0L
+        handler.removeCallbacks(settle)
         try {
-            handler.removeCallbacks(settle)
-            p.stop()
-            p.clearMediaItems()
+            player?.release()
         } catch (_: Exception) {
+        }
+        player = null
+        playBtn.text = "▶"
+    }
+    /** بيرجّع المعاينة بعد ما التصدير يخلص أو يتلغي */
+    private fun restorePlayerAfterExport() {
+        exporting = false
+        if (isDestroyed) return
+        if (player == null) initPlayer()
+        syncPlayer()
+        rebuildTimeline()
+    }
+    private fun thermalStatus(): Int {
+        if (Build.VERSION.SDK_INT < 29) return 0
+        return try {
+            (getSystemService(Context.POWER_SERVICE) as android.os.PowerManager).currentThermalStatus
+        } catch (_: Exception) {
+            0
         }
     }
     private fun saveToMovies(src: File) {
