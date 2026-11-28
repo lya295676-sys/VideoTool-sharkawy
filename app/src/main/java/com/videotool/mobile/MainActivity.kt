@@ -291,6 +291,7 @@ class MainActivity : Activity() {
     }
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
+        releaseWakeLock()
         ExportService.stop(applicationContext)
         try {
             activeTransformer?.cancel()
@@ -2307,6 +2308,15 @@ class MainActivity : Activity() {
     private var exportPoll: Runnable? = null
     @Volatile
     private var exporting = false
+    private var wakeLock: android.os.PowerManager.WakeLock? = null
+    private fun releaseWakeLock() {
+        try {
+            val w = wakeLock
+            if (w != null && w.isHeld) w.release()
+        } catch (_: Exception) {
+        }
+        wakeLock = null
+    }
     private val probeCache = ConcurrentHashMap<Uri, Probe>()
     /** بيقرا من الملف: معدل الفريمات + هل فيه مسار صوت (بيتخزّن عشان مايتكررش) */
     private fun probeSrc(u: Uri): Probe {
@@ -2588,6 +2598,14 @@ class MainActivity : Activity() {
         val holder = ProgressHolder()
         val startTs = System.currentTimeMillis()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // CPU يفضل صاحي حتى لو الشاشة اتقفلت أو رحت لتطبيق تاني (لازم WAKE_LOCK في الـ manifest)
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            val wl = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "VideoTool:export")
+            wl.acquire(6 * 60 * 60 * 1000L)
+            wakeLock = wl
+        } catch (_: Exception) {
+        }
         val stopPoll = {
             val r = exportPoll
             if (r != null) handler.removeCallbacks(r)
@@ -2595,6 +2613,7 @@ class MainActivity : Activity() {
             val appCtx = applicationContext
             handler.postDelayed({ ExportService.stop(appCtx) }, 1500)
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            releaseWakeLock()
             restorePlayerAfterExport()   // نرجّع المعاينة بعد ما التصدير يخلص/يتلغي
         }
         val encFactory = DefaultEncoderFactory.Builder(this)
@@ -3246,9 +3265,16 @@ class ExportService : Service() {
     companion object {
         private const val CH = "export"
         private const val ID = 4711
+        @Volatile
+        private var channelMade = false
+        @Volatile
+        private var lastNotifyMs = 0L
         fun build(ctx: Context, pct: Int): Notification {
-            val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            nm.createNotificationChannel(NotificationChannel(CH, "تصدير الفيديو", NotificationManager.IMPORTANCE_LOW))
+            if (!channelMade) {
+                val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.createNotificationChannel(NotificationChannel(CH, "تصدير الفيديو", NotificationManager.IMPORTANCE_LOW))
+                channelMade = true
+            }
             val li = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName) ?: Intent()
             val open = PendingIntent.getActivity(ctx, 0, li, PendingIntent.FLAG_IMMUTABLE)
             val b = Notification.Builder(ctx, CH)
@@ -3278,6 +3304,9 @@ class ExportService : Service() {
             }
         }
         fun progress(ctx: Context, pct: Int) {
+            val now = System.currentTimeMillis()
+            if (pct < 100 && now - lastNotifyMs < 2000L) return   // مانحدّثش الإشعار كل 1% (بيشغل النظام على الفاضي)
+            lastNotifyMs = now
             try {
                 val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                 nm.notify(ID, build(ctx, pct))
